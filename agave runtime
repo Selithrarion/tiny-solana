@@ -1,0 +1,370 @@
+
+/// Main pipeline from runtime to program execution.
+pub struct InvokeContext<'a, 'ix_data> {
+    /// Information about the currently executing transaction.
+    pub transaction_context: &'a mut TransactionContext<'ix_data>,
+    /// The local program cache for the transaction batch.
+    pub program_cache_for_tx_batch: &'a mut ProgramCacheForTxBatch,
+    /// Runtime configurations used to provision the invocation environment.
+    pub environment_config: EnvironmentConfig<'a>,
+    /// The compute budget for the current invocation.
+    compute_budget: SVMTransactionExecutionBudget,
+    /// The compute cost for the current invocation.
+    execution_cost: SVMTransactionExecutionCost,
+    /// Instruction compute meter, for tracking compute units consumed against
+    /// the designated compute budget during program execution.
+    compute_meter: RefCell<u64>,
+    log_collector: Option<Rc<RefCell<LogCollector>>>,
+    /// Latest measurement not yet accumulated in [ExecuteDetailsTimings::execute_us]
+    pub execute_time: Option<Measure>,
+    pub timings: ExecuteDetailsTimings,
+    pub syscall_context: Vec<Option<SyscallContext>>,
+    /// Pairs of index in TX instruction trace and VM register trace
+    register_traces: Vec<(usize, Vec<[u64; 12]>)>,
+    /// Debug port to use for this executing transaction.
+    #[cfg(feature = "sbpf-debugger")]
+    pub debug_port: Option<u16>,
+}
+
+pub fn create_program_runtime_environment(
+    feature_set: &SVMFeatureSet,
+    compute_budget: &SVMTransactionExecutionBudget,
+    reject_deployment_of_broken_elfs: bool,
+    debugging_features: bool,
+) -> Result<ProgramRuntimeEnvironment, Error> {
+    let enable_alt_bn128_syscall = feature_set.enable_alt_bn128_syscall;
+    let enable_alt_bn128_compression_syscall = feature_set.enable_alt_bn128_compression_syscall;
+    let enable_big_mod_exp_syscall = feature_set.enable_big_mod_exp_syscall;
+    let blake3_syscall_enabled = feature_set.blake3_syscall_enabled;
+    let curve25519_syscall_enabled = feature_set.curve25519_syscall_enabled;
+    let enable_bls12_381_syscall = feature_set.enable_bls12_381_syscall;
+    let disable_fees_sysvar = feature_set.disable_fees_sysvar;
+    let last_restart_slot_syscall_enabled = feature_set.last_restart_slot_sysvar;
+    let enable_poseidon_syscall = feature_set.enable_poseidon_syscall;
+    let remaining_compute_units_syscall_enabled =
+        feature_set.remaining_compute_units_syscall_enabled;
+    let get_sysvar_syscall_enabled = feature_set.get_sysvar_syscall_enabled;
+    let enable_get_epoch_stake_syscall = feature_set.enable_get_epoch_stake_syscall;
+    let min_sbpf_version =
+        if !feature_set.disable_sbpf_v0_execution || feature_set.reenable_sbpf_v0_execution {
+            SBPFVersion::V0
+        } else {
+            SBPFVersion::V3
+        };
+    let max_sbpf_version = if feature_set.enable_sbpf_v3_deployment_and_execution {
+        SBPFVersion::V3
+    } else if feature_set.enable_sbpf_v2_deployment_and_execution {
+        SBPFVersion::V2
+    } else if feature_set.enable_sbpf_v1_deployment_and_execution {
+        SBPFVersion::V1
+    } else {
+        SBPFVersion::V0
+    };
+    debug_assert!(min_sbpf_version <= max_sbpf_version);
+
+    let config = Config {
+        max_call_depth: compute_budget.max_call_depth,
+        stack_frame_size: compute_budget.stack_frame_size,
+        enable_address_translation: true,
+        enable_stack_frame_gaps: !feature_set.virtual_address_space_adjustments,
+        instruction_meter_checkpoint_distance: 10000,
+        enable_instruction_meter: true,
+        enable_register_tracing: debugging_features,
+        enable_symbol_and_section_labels: debugging_features,
+        reject_broken_elfs: reject_deployment_of_broken_elfs,
+        noop_instruction_rate: 256,
+        sanitize_user_provided_values: true,
+        enabled_sbpf_versions: min_sbpf_version..=max_sbpf_version,
+        optimize_rodata: false,
+        aligned_memory_mapping: !feature_set.virtual_address_space_adjustments,
+        allow_memory_region_zero: feature_set.enable_sbpf_v3_deployment_and_execution,
+        // Warning, do not use `Config::default()` so that configuration here is explicit.
+    };
+
+    // NOTE: `register` calls are checked by gen-syscall-list to create
+    // the list of syscalls. If this function name is changed, or if a new one
+    // is added, then gen-syscall-list/build.rs must also be updated.
+    let mut result = BuiltinProgram::new_loader(config);
+
+    // Abort
+    SyscallAbort::register(&mut result, "abort")?;
+
+    // Panic
+    SyscallPanic::register(&mut result, "sol_panic_")?;
+
+    // Logging
+    SyscallLog::register(&mut result, "sol_log_")?;
+    SyscallLogU64::register(&mut result, "sol_log_64_")?;
+    SyscallLogPubkey::register(&mut result, "sol_log_pubkey")?;
+    SyscallLogBpfComputeUnits::register(&mut result, "sol_log_compute_units_")?;
+
+    // Program defined addresses (PDA)
+    SyscallCreateProgramAddress::register(&mut result, "sol_create_program_address")?;
+    SyscallTryFindProgramAddress::register(&mut result, "sol_try_find_program_address")?;
+
+    // Sha256
+    SyscallHash::<Sha256Hasher>::register(&mut result, "sol_sha256")?;
+
+    // Keccak256
+    SyscallHash::<Keccak256Hasher>::register(&mut result, "sol_keccak256")?;
+
+    // Secp256k1 Recover
+    SyscallSecp256k1Recover::register(&mut result, "sol_secp256k1_recover")?;
+
+    // Blake3
+    register_feature_gated_function!(
+        result,
+        blake3_syscall_enabled,
+        "sol_blake3",
+        SyscallHash::<Blake3Hasher>
+    )?;
+
+    // Elliptic Curve Operations
+    register_feature_gated_function!(
+        result,
+        curve25519_syscall_enabled,
+        "sol_curve_validate_point",
+        SyscallCurvePointValidation
+    )?;
+    register_feature_gated_function!(
+        result,
+        curve25519_syscall_enabled,
+        "sol_curve_group_op",
+        SyscallCurveGroupOps
+    )?;
+    register_feature_gated_function!(
+        result,
+        curve25519_syscall_enabled,
+        "sol_curve_multiscalar_mul",
+        SyscallCurveMultiscalarMultiplication
+    )?;
+    register_feature_gated_function!(
+        result,
+        enable_bls12_381_syscall,
+        "sol_curve_decompress",
+        SyscallCurveDecompress
+    )?;
+    register_feature_gated_function!(
+        result,
+        enable_bls12_381_syscall,
+        "sol_curve_pairing_map",
+        SyscallCurvePairingMap
+    )?;
+
+    // Sysvars
+    SyscallGetClockSysvar::register(&mut result, "sol_get_clock_sysvar")?;
+    SyscallGetEpochScheduleSysvar::register(&mut result, "sol_get_epoch_schedule_sysvar")?;
+    register_feature_gated_function!(
+        result,
+        !disable_fees_sysvar,
+        "sol_get_fees_sysvar",
+        SyscallGetFeesSysvar
+    )?;
+    SyscallGetRentSysvar::register(&mut result, "sol_get_rent_sysvar")?;
+
+    register_feature_gated_function!(
+        result,
+        last_restart_slot_syscall_enabled,
+        "sol_get_last_restart_slot",
+        SyscallGetLastRestartSlotSysvar
+    )?;
+
+    SyscallGetEpochRewardsSysvar::register(&mut result, "sol_get_epoch_rewards_sysvar")?;
+
+    // Memory ops
+    SyscallMemcpy::register(&mut result, "sol_memcpy_")?;
+    SyscallMemmove::register(&mut result, "sol_memmove_")?;
+    SyscallMemset::register(&mut result, "sol_memset_")?;
+    SyscallMemcmp::register(&mut result, "sol_memcmp_")?;
+
+    // Processed sibling instructions
+    SyscallGetProcessedSiblingInstruction::register(
+        &mut result,
+        "sol_get_processed_sibling_instruction",
+    )?;
+
+    // Stack height
+    SyscallGetStackHeight::register(&mut result, "sol_get_stack_height")?;
+
+    // Return data
+    SyscallSetReturnData::register(&mut result, "sol_set_return_data")?;
+    SyscallGetReturnData::register(&mut result, "sol_get_return_data")?;
+
+    // Cross-program invocation
+    SyscallInvokeSignedC::register(&mut result, "sol_invoke_signed_c")?;
+    SyscallInvokeSignedRust::register(&mut result, "sol_invoke_signed_rust")?;
+
+    // Memory allocator
+    register_feature_gated_function!(
+        result,
+        !reject_deployment_of_broken_elfs,
+        "sol_alloc_free_",
+        SyscallAllocFree
+    )?;
+
+    // Alt_bn128
+    register_feature_gated_function!(
+        result,
+        enable_alt_bn128_syscall,
+        "sol_alt_bn128_group_op",
+        SyscallAltBn128
+    )?;
+
+    // Big_mod_exp
+    register_feature_gated_function!(
+        result,
+        enable_big_mod_exp_syscall,
+        "sol_big_mod_exp",
+        SyscallBigModExp
+    )?;
+
+    // Poseidon
+    register_feature_gated_function!(
+        result,
+        enable_poseidon_syscall,
+        "sol_poseidon",
+        SyscallPoseidon
+    )?;
+
+    // Accessing remaining compute units
+    register_feature_gated_function!(
+        result,
+        remaining_compute_units_syscall_enabled,
+        "sol_remaining_compute_units",
+        SyscallRemainingComputeUnits
+    )?;
+
+    // Alt_bn128_compression
+    register_feature_gated_function!(
+        result,
+        enable_alt_bn128_compression_syscall,
+        "sol_alt_bn128_compression",
+        SyscallAltBn128Compression
+    )?;
+
+    // Sysvar getter
+    register_feature_gated_function!(
+        result,
+        get_sysvar_syscall_enabled,
+        "sol_get_sysvar",
+        SyscallGetSysvar
+    )?;
+
+    // Get Epoch Stake
+    register_feature_gated_function!(
+        result,
+        enable_get_epoch_stake_syscall,
+        "sol_get_epoch_stake",
+        SyscallGetEpochStake
+    )?;
+
+    // Log data
+    SyscallLogData::register(&mut result, "sol_log_data")?;
+
+    Ok(ProgramRuntimeEnvironment::from(result))
+}
+
+declare_builtin_function!(
+    /// Abort syscall functions, called when the SBF program calls `abort()`
+    /// LLVM will insert calls to `abort()` if it detects an untenable situation,
+    /// `abort()` is not intended to be called explicitly by the program.
+    /// Causes the SBF program to be halted immediately
+    SyscallAbort,
+    fn rust(
+        _invoke_context: &mut InvokeContext,
+        _arg1: u64,
+        _arg2: u64,
+        _arg3: u64,
+        _arg4: u64,
+        _arg5: u64,
+        _memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        Err(SyscallError::Abort.into())
+    }
+);
+
+declare_builtin_function!(
+    /// Panic syscall function, called when the SBF program calls 'sol_panic_()`
+    /// Causes the SBF program to be halted immediately
+    SyscallPanic,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        file: u64,
+        len: u64,
+        line: u64,
+        column: u64,
+        _arg5: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        consume_compute_meter(invoke_context, len)?;
+
+        translate_string_and_do(
+            memory_mapping,
+            file,
+            len,
+            invoke_context.get_check_aligned(),
+            &mut |string: &str| Err(SyscallError::Panic(string.to_string(), line, column).into()),
+        )
+    }
+);
+pub fn create_custom_loader<'a>() -> BuiltinProgram<InvokeContext<'a, 'a>> {
+    let compute_budget = SVMTransactionExecutionBudget::default();
+    let vm_config = Config {
+        max_call_depth: compute_budget.max_call_depth,
+        stack_frame_size: compute_budget.stack_frame_size,
+        enable_address_translation: true,
+        enable_stack_frame_gaps: true,
+        instruction_meter_checkpoint_distance: 10000,
+        enable_instruction_meter: true,
+        enable_register_tracing: true,
+        enable_symbol_and_section_labels: true,
+        reject_broken_elfs: true,
+        noop_instruction_rate: 256,
+        sanitize_user_provided_values: true,
+        enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V3,
+        optimize_rodata: false,
+        aligned_memory_mapping: false,
+        allow_memory_region_zero: true,
+    };
+
+    // These functions are system calls the compile contract calls during execution, so they
+    // need to be registered.
+    let mut loader = BuiltinProgram::new_loader(vm_config);
+    loader
+        .register_function("abort", SyscallAbort::vm)
+        .expect("Registration failed");
+    loader
+        .register_function("sol_log_", SyscallLog::vm)
+        .expect("Registration failed");
+    loader
+        .register_function("sol_memcpy_", SyscallMemcpy::vm)
+        .expect("Registration failed");
+    loader
+        .register_function("sol_memset_", SyscallMemset::vm)
+        .expect("Registration failed");
+    loader
+        .register_function("sol_memcmp_", SyscallMemcmp::vm)
+        .expect("Registration failed");
+    loader
+        .register_function("sol_memmove_", SyscallMemmove::vm)
+        .expect("Registration failed");
+    loader
+        .register_function("sol_invoke_signed_rust", SyscallInvokeSignedRust::vm)
+        .expect("Registration failed");
+    loader
+        .register_function("sol_set_return_data", SyscallSetReturnData::vm)
+        .expect("Registration failed");
+    loader
+        .register_function("sol_get_clock_sysvar", SyscallGetClockSysvar::vm)
+        .expect("Registration failed");
+    loader
+        .register_function("sol_get_rent_sysvar", SyscallGetRentSysvar::vm)
+        .expect("Registration failed");
+    loader
+        .register_function(
+            "sol_get_epoch_schedule_sysvar",
+            SyscallGetEpochScheduleSysvar::vm,
+        )
+        .expect("Registration failed");
+    loader
+}
